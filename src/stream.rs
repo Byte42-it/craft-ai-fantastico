@@ -1,0 +1,322 @@
+//! Server-sent events from a chat-completions stream, put back together into the reply a
+//! non-streamed request would have got.
+//!
+//! Every piece of message text goes to `on_text` as it arrives. Tool calls arrive in pieces keyed
+//! by `index` and are assembled. An `error` event becomes the body, so the SDK classifies it as it
+//! would a `200` carrying an error. `stop` is asked before every line: when it says yes, reading
+//! ends at once with an error, which closes the connection and so ends the provider's work.
+
+use std::io::{BufRead, Read};
+
+use serde_json::{Map, Value, json};
+
+/// A longer server-sent event line is refused: a chunk is a few hundred bytes.
+pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// Most parallel tool calls kept in one reply; a higher index lands in the last slot.
+pub(crate) const MAX_TOOL_CALLS: usize = 64;
+
+pub(crate) fn assemble(
+    mut reader: impl BufRead,
+    on_text: &mut dyn FnMut(&str),
+    stop: &dyn Fn() -> bool,
+) -> Result<Value, String> {
+    let mut a = Assembler::default();
+    let mut line = String::new();
+    let cap = u64::try_from(MAX_LINE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    loop {
+        if stop() {
+            return Err("the job was stopped".into());
+        }
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(cap)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            return Err("the LLM provider sent an event too long to read".into());
+        }
+        let l = line.trim_end_matches(['\r', '\n']);
+        let Some(data) = l.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if chunk.get("error").is_some() {
+            return Ok(chunk);
+        }
+        a.feed(&chunk, on_text);
+    }
+    Ok(a.finish())
+}
+
+/// One tool call under construction.
+#[derive(Default)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct Assembler {
+    id: Option<Value>,
+    model: Option<Value>,
+    created: Option<Value>,
+    role: Option<String>,
+    content: String,
+    has_content: bool,
+    tool_calls: Vec<ToolCall>,
+    finish_reason: Option<Value>,
+    usage: Option<Value>,
+}
+
+impl Assembler {
+    fn feed(&mut self, chunk: &Value, on_text: &mut dyn FnMut(&str)) {
+        for (slot, key) in [
+            (&mut self.id, "id"),
+            (&mut self.model, "model"),
+            (&mut self.created, "created"),
+        ] {
+            if slot.is_none()
+                && let Some(v) = chunk.get(key).filter(|v| !v.is_null())
+            {
+                *slot = Some(v.clone());
+            }
+        }
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(u.clone());
+        }
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            return;
+        };
+        if let Some(f) = choice.get("finish_reason").filter(|f| !f.is_null()) {
+            self.finish_reason = Some(f.clone());
+        }
+        let Some(delta) = choice.get("delta") else {
+            return;
+        };
+        if let Some(r) = delta.get("role").and_then(Value::as_str) {
+            self.role = Some(r.to_owned());
+        }
+        if let Some(t) = delta.get("content").and_then(Value::as_str) {
+            self.has_content = true;
+            if !t.is_empty() {
+                self.content.push_str(t);
+                on_text(t);
+            }
+        }
+        for (n, call) in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .map_or(n, |i| usize::try_from(i).unwrap_or(n))
+                .min(MAX_TOOL_CALLS);
+            while self.tool_calls.len() <= index {
+                self.tool_calls.push(ToolCall::default());
+            }
+            let Some(slot) = self.tool_calls.get_mut(index) else {
+                continue;
+            };
+            if let Some(id) = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                slot.id = id.to_owned();
+            }
+            if let Some(name) = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                slot.name = name.to_owned();
+            }
+            if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                slot.arguments.push_str(args);
+            }
+        }
+    }
+
+    fn finish(self) -> Value {
+        let mut message = Map::new();
+        message.insert(
+            "role".into(),
+            json!(self.role.unwrap_or_else(|| "assistant".into())),
+        );
+        message.insert(
+            "content".into(),
+            if self.has_content || self.tool_calls.is_empty() {
+                json!(self.content)
+            } else {
+                Value::Null
+            },
+        );
+        if !self.tool_calls.is_empty() {
+            let calls: Vec<Value> = self
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({
+                        "id": if c.id.is_empty() { format!("call_{i}") } else { c.id },
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments}
+                    })
+                })
+                .collect();
+            message.insert("tool_calls".into(), Value::Array(calls));
+        }
+        let mut out = Map::new();
+        out.insert("object".into(), json!("chat.completion"));
+        for (key, v) in [
+            ("id", self.id),
+            ("model", self.model),
+            ("created", self.created),
+            ("usage", self.usage),
+        ] {
+            if let Some(v) = v {
+                out.insert(key.into(), v);
+            }
+        }
+        out.insert(
+            "choices".into(),
+            json!([{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason.unwrap_or(Value::Null)
+            }]),
+        );
+        Value::Object(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn stream(lines: &[&str]) -> (Value, Vec<String>) {
+        let text = lines.join("\n") + "\n";
+        let mut pieces = Vec::new();
+        let v = assemble(text.as_bytes(), &mut |t| pieces.push(t.to_owned()), &|| {
+            false
+        })
+        .unwrap();
+        (v, pieces)
+    }
+
+    #[test]
+    fn text_pieces_arrive_in_order_and_make_the_usual_reply() {
+        let (v, pieces) = stream(&[
+            ": OPENROUTER PROCESSING",
+            r#"data: {"id":"gen-1","model":"m","created":7,"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+            r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#,
+            "",
+            r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"lo."},"finish_reason":null}]}"#,
+            r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":3,"cost":0.01}}"#,
+            "data: [DONE]",
+            r#"data: {"choices":[{"delta":{"content":"ignored after done"}}]}"#,
+        ]);
+        assert_eq!(pieces, ["Hel", "lo."]);
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello.");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["cost"], 0.01);
+        assert_eq!(
+            (v["id"].as_str(), v["model"].as_str(), v["created"].as_u64()),
+            (Some("gen-1"), Some("m"), Some(7))
+        );
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn tool_calls_are_put_together_from_their_pieces() {
+        let (v, pieces) = stream(&[
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"type_text","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"text\": \"Hi"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"get_text","arguments":"{}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ]);
+        assert!(pieces.is_empty());
+        let m = &v["choices"][0]["message"];
+        assert_eq!(m["content"], Value::Null);
+        assert_eq!(m["tool_calls"][0]["id"], "call_a");
+        assert_eq!(
+            m["tool_calls"][0]["function"]["arguments"],
+            r#"{"text": "Hi"}"#
+        );
+        assert_eq!(m["tool_calls"][1]["function"]["name"], "get_text");
+    }
+
+    #[test]
+    fn an_error_event_becomes_the_body_and_junk_never_panics() {
+        let (v, pieces) = stream(&[
+            r#"data: {"choices":[{"delta":{"content":"par"}}]}"#,
+            "data: not json at all",
+            r#"data: {"error":{"message":"overloaded","code":503}}"#,
+            r#"data: {"choices":[{"delta":{"content":"never"}}]}"#,
+        ]);
+        assert_eq!(pieces, ["par"]);
+        assert_eq!(v["error"]["message"], "overloaded");
+        let (v, _) = stream(&[]);
+        assert_eq!(v["choices"][0]["message"]["content"], "");
+        let (v, _) = stream(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1e12,"function":{"name":"x"}}]}}]}"#,
+            r#"data: {"choices":"nope"}"#,
+            r#"data: {"choices":[{"delta":"nope"}]}"#,
+            r#"data: 7"#,
+        ]);
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let (v, _) = stream(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":123456789,"function":{"name":"x"}}]}}]}"#,
+        ]);
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .map(Vec::len),
+            Some(MAX_TOOL_CALLS + 1)
+        );
+        let long = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}",
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        assert!(assemble(long.as_bytes(), &mut |_| {}, &|| false).is_err());
+    }
+
+    #[test]
+    fn a_stop_ends_reading_before_the_next_line() {
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n";
+        let seen = Cell::new(0);
+        let mut pieces = Vec::new();
+        let r = assemble(text.as_bytes(), &mut |t| pieces.push(t.to_owned()), &|| {
+            seen.set(seen.get() + 1);
+            seen.get() > 1
+        });
+        assert!(r.is_err());
+        assert_eq!(pieces, ["a"]);
+    }
+}

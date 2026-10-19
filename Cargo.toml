@@ -1,0 +1,25 @@
+[package]
+name = "craft-ai-fantastico"
+description = "A FANTASTICO account as a provider for the Craft AI layer: every major LLM from one prepaid credit, streaming and tool calls included. Native only."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# The Craft AI contract is provisional (see README): pinned to one revision until it settles.
+craft-ai-core = { git = "https://github.com/storytold/craft-ai-integrations", rev = "ea85917afe35afcd48a6d19a27daca0621c74db2" }
+craft-ai-http = { git = "https://github.com/storytold/craft-ai-integrations", rev = "ea85917afe35afcd48a6d19a27daca0621c74db2" }
+# Mints the account's runtime keys, fills in `max_tokens`, retries and classifies failures. Its own
+# transport is left out: requests go through ours, which streams and takes the layer's TLS rule.
+fantastico-sdk = { version = "0.1.1", default-features = false }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
