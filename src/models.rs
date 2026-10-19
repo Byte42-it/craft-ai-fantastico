@@ -23,14 +23,18 @@ use serde_json::Value;
 pub(crate) const MAX_MODELS: usize = 4096;
 /// Labels are shown in a picker: longer ones are cut.
 const MAX_LABEL_CHARS: usize = 120;
+/// Most conversation turns in one request: a long agent session, with room to spare.
+pub(crate) const MAX_TURNS: u32 = 1024;
 
+/// No input is required: a request has prompts or conversation turns, and `chat::plan` refuses
+/// one with neither.
 fn text_spec(features: Features) -> Option<CapabilitySpec> {
     Some(
         CapabilitySpec::new(CapabilityId::parse("text.complete").ok()?)
             .accepting(InputRole::Prompt, 64)
-            .requiring(InputRole::Prompt)
             .accepting(InputRole::Context, 64)
             .accepting(InputRole::System, 1)
+            .accepting(InputRole::parse(crate::chat::TURN).ok()?, MAX_TURNS)
             .with_features(features),
     )
 }

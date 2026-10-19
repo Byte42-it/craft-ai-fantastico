@@ -347,3 +347,41 @@ fn too_many_jobs_at_once_is_a_rate_limit_not_a_queue() {
     p.cancel(&b).unwrap();
     assert!(p.submit(&model(), &chat("d")).is_ok());
 }
+
+/// What an agent loop does: the conversation so far as turns, the whole reply back.
+#[test]
+fn a_conversation_goes_out_as_turns_and_the_whole_reply_comes_back() {
+    let p = provider(&Fake::new(Chat::Tools));
+    let turn = |v: Value| {
+        (
+            InputRole::parse(craft_ai_fantastico::TURN).unwrap(),
+            Payload::text(v.to_string()),
+        )
+    };
+    let mut req = Request::new(CapabilityId::parse("text.complete").unwrap())
+        .with_param("tools", json!([{"type": "function"}]))
+        .streaming();
+    for (role, payload) in [
+        turn(json!({"role": "system", "content": "You edit documents."})),
+        turn(json!({"role": "user", "content": "type hi"})),
+    ] {
+        req = req.with_input(role, payload);
+    }
+    let (state, events, _) = finish(&p, &req);
+    assert_eq!(state, JobState::Succeeded);
+    let completion = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Output(o) if o.label.as_deref() == Some(craft_ai_fantastico::COMPLETION) => {
+                Some(o.payload.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let Payload::Inline { data, .. } = completion else {
+        panic!()
+    };
+    let reply: Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(reply["choices"][0]["message"]["tool_calls"][0]["id"], "c1");
+    assert_eq!(reply["choices"][0]["finish_reason"], "tool_calls");
+}

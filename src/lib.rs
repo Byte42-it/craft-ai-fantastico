@@ -11,6 +11,10 @@
 //! |---|---|
 //! | `text.complete` | streaming, tool calls, structured output, cost per request |
 //!
+//! An agent loop sends its whole conversation as [`TURN`] inputs (earlier replies and tool
+//! results included) and reads the whole reply from the output labelled [`COMPLETION`]; see the
+//! `chat` module. This is this adapter's own extension until the contract has turns.
+//!
 //! Not yet: images, speech, embeddings, image input to chat, cost estimates before a job. Each is
 //! refused with a clear `Unsupported` error.
 //!
@@ -71,6 +75,7 @@ use craft_ai_core::{
 };
 use fantastico_sdk::{Fantastico, Options};
 
+pub use crate::chat::{COMPLETION, TURN};
 use crate::jobs::Registry;
 use crate::transport::SdkTransport;
 pub use crate::transport::{UreqWire, Wire, WireResponse};
@@ -287,6 +292,9 @@ impl Provider for FantasticoProvider {
             for event in chat::events_for(&completion, plan.structured, plan.stream)? {
                 cell.push(event);
             }
+            if plan.conversation {
+                cell.push(chat::completion_output(&reply)?);
+            }
             Ok(completion.usage)
         })
     }
@@ -315,6 +323,26 @@ pub fn build(
     connection: &Connection,
     key: Option<SecretString>,
 ) -> Result<Arc<dyn Provider>, AiError> {
+    build_with(connection, key, None)
+}
+
+/// As [`build`], naming the app in the provider's usage reports: register
+/// `build_titled("WordCraft")` instead of `build`.
+pub fn build_titled(
+    title: impl Into<String>,
+) -> impl Fn(&Connection, Option<SecretString>) -> Result<Arc<dyn Provider>, AiError>
++ Send
++ Sync
++ 'static {
+    let title = title.into();
+    move |connection, key| build_with(connection, key, Some(title.clone()))
+}
+
+fn build_with(
+    connection: &Connection,
+    key: Option<SecretString>,
+    title: Option<String>,
+) -> Result<Arc<dyn Provider>, AiError> {
     let key = key.filter(|k| !k.is_empty()).ok_or_else(|| {
         AiError::new(
             ErrorKind::Auth,
@@ -325,6 +353,9 @@ pub fn build(
         )
     })?;
     let mut config = FantasticoConfig::new(key);
+    if let Some(title) = title {
+        config = config.with_title(title);
+    }
     if let Some(endpoint) = &connection.endpoint {
         config = config.with_base_url(endpoint.clone());
     }
@@ -400,5 +431,7 @@ mod tests {
     fn build_fits_the_factory() {
         let f: Arc<BuildFn> = Arc::new(build);
         assert!(f(&connection(None), Some(key())).is_ok());
+        let titled: Arc<BuildFn> = Arc::new(build_titled("WordCraft"));
+        assert!(titled(&connection(None), Some(key())).is_ok());
     }
 }

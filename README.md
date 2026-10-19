@@ -34,6 +34,19 @@ An app that does not register the adapter reports the connection as one it canno
 Not yet: images, speech, embeddings, image input to chat, cost estimates before a job. Each is
 refused with a clear `Unsupported` error before anything is sent.
 
+`build_titled("WordCraft")` registers the same adapter with the app's name in the provider's usage
+reports.
+
+### Conversations (this adapter's extension)
+
+The Craft AI contract has no input for an earlier assistant reply or a tool result, which an agent
+loop needs, and its `ToolCall` event has no call id. Until it has both, this adapter takes a `turn`
+input (`craft_ai_fantastico::TURN`): one chat message as JSON, any of system, user, assistant (with
+`tool_calls`) or tool (with `tool_call_id`). A request with turns also gets the whole reply as one
+`application/json` output labelled `completion` (`craft_ai_fantastico::COMPLETION`), ids and finish
+reason included. Other adapters refuse turns as `Unsupported`. WordCraft's GeenioAI runs its agent
+loop this way.
+
 ## How it behaves
 
 - **Models** come from the account service and double as the connection test: the key is checked

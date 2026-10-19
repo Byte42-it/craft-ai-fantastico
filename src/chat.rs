@@ -1,9 +1,20 @@
 //! Chat completions: the request body built from a [`Request`], and the reply turned into job
 //! events. Pure (no I/O), so it is tested without a server.
 //!
-//! Inputs become messages in the order given, except that `system` inputs come first: `system`
+//! Inputs become messages in the order given, except that system messages come first: `system`
 //! becomes a system message, `prompt` and `context` become user messages. Only text inputs are
 //! sent; anything else is refused rather than dropped.
+//!
+//! # Conversations
+//!
+//! The Craft AI contract has no input for an earlier assistant reply or a tool result, which an
+//! agent loop needs. Until it has, this adapter takes a [`TURN`] input: one chat message as JSON
+//! (`{"role": "assistant", "tool_calls": […]}`, `{"role": "tool", "tool_call_id": …}`, or a user
+//! or system message), as text or as an `application/json` payload. Only `role`, `content`,
+//! `name`, `tool_calls` and `tool_call_id` are kept. A request with any turn also gets the whole
+//! reply as one `application/json` output labelled [`COMPLETION`], so the caller has the tool
+//! calls' ids and the finish reason to carry the conversation on. Other adapters do not know
+//! these turns and refuse them as `Unsupported`.
 //!
 //! Params passed through (anything else is ignored, so a param can never steer the URL, a key or
 //! the account): `temperature`, `top_p`, `max_tokens`, `seed`, `stop`, `frequency_penalty`,
@@ -31,40 +42,96 @@ const PASS_THROUGH: &[&str] = &[
     "response_format",
 ];
 
+/// The input role of one conversation message (see the module docs).
+pub const TURN: &str = "turn";
+/// The label of the output that carries the whole reply of a conversation request.
+pub const COMPLETION: &str = "completion";
+
+/// The keys of a chat message that are sent on.
+const MESSAGE_KEYS: &[&str] = &["role", "content", "name", "tool_calls", "tool_call_id"];
+
 /// A request ready to send.
 #[derive(Debug)]
 pub(crate) struct ChatPlan {
     pub body: Value,
     pub stream: bool,
     pub structured: bool,
+    /// The request carried turns: the caller wants the whole reply back.
+    pub conversation: bool,
+}
+
+/// One turn's message, checked and cut down to the keys that are sent on.
+fn turn_message(payload: &Payload) -> Result<Value, AiError> {
+    let parsed = match payload {
+        Payload::Text { text } => serde_json::from_str::<Value>(text),
+        Payload::Inline { media_type, data } if media_type.as_str() == "application/json" => {
+            serde_json::from_slice::<Value>(data)
+        }
+        _ => {
+            return Err(AiError::unsupported(
+                "a turn is one chat message as JSON text or application/json",
+            ));
+        }
+    }
+    .map_err(|_| AiError::invalid("a turn is not valid JSON"))?;
+    let Some(message) = parsed.as_object() else {
+        return Err(AiError::invalid("a turn must be a JSON object"));
+    };
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    if !matches!(role, "system" | "user" | "assistant" | "tool") {
+        return Err(AiError::invalid(format!(
+            "a turn's role must be system, user, assistant or tool, not \"{}\"",
+            role.chars().take(32).collect::<String>()
+        )));
+    }
+    if role == "tool" && !message.get("tool_call_id").is_some_and(Value::is_string) {
+        return Err(AiError::invalid("a tool turn needs its tool_call_id"));
+    }
+    let kept = MESSAGE_KEYS
+        .iter()
+        .filter_map(|k| message.get(*k).map(|v| ((*k).to_owned(), v.clone())))
+        .collect();
+    Ok(Value::Object(kept))
 }
 
 pub(crate) fn plan(model: &str, req: &Request) -> Result<ChatPlan, AiError> {
+    let turn =
+        InputRole::parse(TURN).map_err(|e| AiError::new(ErrorKind::Internal, e.to_string()))?;
     let mut system = Vec::new();
     let mut messages = Vec::new();
+    let mut conversation = false;
     for input in &req.inputs {
-        let is_system = input.role == InputRole::System;
-        if !is_system && input.role != InputRole::Prompt && input.role != InputRole::Context {
-            return Err(AiError::unsupported(format!(
-                "chat models do not take a {} input",
-                input.role
-            )));
-        }
-        let Payload::Text { text } = &input.payload else {
-            return Err(AiError::unsupported(
-                "this adapter sends text inputs to chat models only",
-            ));
-        };
-        if is_system {
-            system.push(json!({"role": "system", "content": text}));
+        let message = if input.role == turn {
+            conversation = true;
+            turn_message(&input.payload)?
         } else {
-            messages.push(json!({"role": "user", "content": text}));
+            let role = if input.role == InputRole::System {
+                "system"
+            } else if input.role == InputRole::Prompt || input.role == InputRole::Context {
+                "user"
+            } else {
+                return Err(AiError::unsupported(format!(
+                    "chat models do not take a {} input",
+                    input.role
+                )));
+            };
+            let Payload::Text { text } = &input.payload else {
+                return Err(AiError::unsupported(
+                    "this adapter sends text inputs to chat models only",
+                ));
+            };
+            json!({"role": role, "content": text})
+        };
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            system.push(message);
+        } else {
+            messages.push(message);
         }
     }
     // System messages first whatever order they came in: some models refuse one after a user turn.
     system.append(&mut messages);
     if system.is_empty() {
-        return Err(AiError::invalid("a chat request needs a prompt"));
+        return Err(AiError::invalid("a chat request needs a prompt or turns"));
     }
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -82,7 +149,18 @@ pub(crate) fn plan(model: &str, req: &Request) -> Result<ChatPlan, AiError> {
         body: Value::Object(body),
         stream: req.stream,
         structured: req.params.contains_key("response_format"),
+        conversation,
     })
+}
+
+/// The output that hands a conversation's caller the whole reply.
+pub(crate) fn completion_output(reply: &Value) -> Result<Event, AiError> {
+    let bytes = serde_json::to_vec(reply)
+        .map_err(|_| AiError::new(ErrorKind::Internal, "could not encode the reply"))?;
+    Ok(Event::Output(Output {
+        payload: Payload::inline("application/json", bytes)?,
+        label: Some(COMPLETION.to_owned()),
+    }))
 }
 
 /// What a finished reply held.
@@ -232,6 +310,87 @@ mod tests {
         assert_eq!(p.body["model"], "m");
         assert!(p.body.get("user").is_none());
         assert!(p.body.get("base_url").is_none());
+    }
+
+    fn turn(v: Value) -> (InputRole, Payload) {
+        (
+            InputRole::parse(TURN).unwrap(),
+            Payload::text(v.to_string()),
+        )
+    }
+
+    #[test]
+    fn a_conversation_with_tool_results_is_sent_as_given() {
+        let mut r = req();
+        for (role, payload) in [
+            turn(json!({"role": "user", "content": "type hi"})),
+            turn(json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "type_text", "arguments": "{}"}}]})),
+            turn(
+                json!({"role": "tool", "tool_call_id": "c1", "content": "ok", "extra": "dropped"}),
+            ),
+            turn(json!({"role": "system", "content": "be brief"})),
+        ] {
+            r = r.with_input(role, payload);
+        }
+        let json_turn = Payload::inline(
+            "application/json",
+            br#"{"role":"user","content":"thanks"}"#.to_vec(),
+        )
+        .unwrap();
+        r = r.with_input(InputRole::parse(TURN).unwrap(), json_turn);
+        let p = plan("m", &r).unwrap();
+        assert!(p.conversation);
+        let m = p.body["messages"].as_array().unwrap();
+        let roles: Vec<_> = m.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "user"]);
+        assert_eq!(m[2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(m[3]["tool_call_id"], "c1");
+        assert!(m[3].get("extra").is_none());
+        assert!(
+            !plan(
+                "m",
+                &req().with_input(InputRole::Prompt, Payload::text("x"))
+            )
+            .unwrap()
+            .conversation
+        );
+    }
+
+    #[test]
+    fn bad_turns_are_refused() {
+        for (v, kind) in [
+            (Payload::text("not json"), ErrorKind::InvalidRequest),
+            (Payload::text("[1]"), ErrorKind::InvalidRequest),
+            (
+                Payload::text(r#"{"role":"wizard"}"#),
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                Payload::text(r#"{"role":"tool","content":"x"}"#),
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                Payload::inline("image/png", vec![1]).unwrap(),
+                ErrorKind::Unsupported,
+            ),
+        ] {
+            let r = req().with_input(InputRole::parse(TURN).unwrap(), v);
+            assert_eq!(plan("m", &r).unwrap_err().kind, kind);
+        }
+    }
+
+    #[test]
+    fn the_whole_reply_comes_back_labelled() {
+        let reply = json!({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]});
+        let Event::Output(o) = completion_output(&reply).unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.label.as_deref(), Some(COMPLETION));
+        let Payload::Inline { data, .. } = o.payload else {
+            panic!()
+        };
+        assert_eq!(serde_json::from_slice::<Value>(&data).unwrap(), reply);
     }
 
     #[test]
