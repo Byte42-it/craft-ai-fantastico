@@ -10,7 +10,8 @@ every app that registers the adapter can run its text tools on any of those mode
 
 A FANTASTICO account key is never sent to a model. `fantastico-sdk` trades it for a short-lived
 runtime key capped to part of the credit, renews that key before it expires, fits `max_tokens` to
-the cap, and sends the chat request straight to the provider behind the account, so the account
+the cap, and sends the chat request straight to the provider behind the account, at the address
+the account service gives with the key, so the account
 service never sees a prompt. A custom OpenAI-compatible connection cannot do the exchange, and the
 layer's declarative adapter rules out token refresh and streaming by design. So this crate
 implements `craft_ai_core::Provider` on top of the SDK.

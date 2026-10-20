@@ -3,7 +3,8 @@
 //! [FANTASTICO](https://fantastico.cc) holds one prepaid credit with spending caps and fronts every
 //! major LLM (Claude, GPT, Gemini, Llama…). Its account key cannot be sent to a model directly:
 //! `fantastico-sdk` trades it for a short-lived, capped runtime key and sends the chat request
-//! straight to the provider behind the account, so the account service never sees a prompt. That
+//! straight to the provider behind the account, at the address the account service gives with the
+//! key, so the account service never sees a prompt. That
 //! exchange (and its renewal, and `max_tokens` fitted to the cap) is why FANTASTICO needs this
 //! adapter rather than a custom OpenAI-compatible connection or a declarative spec.
 //!

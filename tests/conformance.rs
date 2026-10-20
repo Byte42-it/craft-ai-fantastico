@@ -115,6 +115,7 @@ impl Wire for Fake {
             return Ok(json_reply(
                 200,
                 json!({"runtimeKey": RUNTIME_KEY, "expiresAt": "2099-01-01T00:00:00.000Z",
+                       "baseUrl": "https://models.example/v1",
                        "recordId": "rec-1", "limit": 5.0, "cost": "0"}),
             ));
         }
@@ -318,7 +319,8 @@ fn each_key_goes_only_where_it_belongs_and_one_key_serves_many_jobs() {
         if url.starts_with(BASE) {
             assert_eq!(auth, &format!("Bearer {ACCOUNT_KEY}"), "{url}");
         } else {
-            assert!(url.ends_with(CHAT), "{url}");
+            // The runtime key goes where the mint said, and nowhere else.
+            assert_eq!(url, &format!("https://models.example/v1{CHAT}"));
             assert_eq!(auth, &format!("Bearer {RUNTIME_KEY}"));
         }
     }
