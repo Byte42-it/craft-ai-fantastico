@@ -14,11 +14,23 @@ use serde_json::{Map, Value, json};
 pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Most parallel tool calls kept in one reply; a higher index lands in the last slot.
 pub(crate) const MAX_TOOL_CALLS: usize = 64;
+/// Most bytes of text and tool calls kept from one stream: the cap a whole reply has
+/// (`transport::MAX_BODY_BYTES`), so streaming is no way around it.
+pub(crate) const MAX_ASSEMBLED_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn assemble(
+    reader: impl BufRead,
+    on_text: &mut dyn FnMut(&str),
+    stop: &dyn Fn() -> bool,
+) -> Result<Value, String> {
+    assemble_capped(reader, on_text, stop, MAX_ASSEMBLED_BYTES)
+}
+
+fn assemble_capped(
     mut reader: impl BufRead,
     on_text: &mut dyn FnMut(&str),
     stop: &dyn Fn() -> bool,
+    max_bytes: usize,
 ) -> Result<Value, String> {
     let mut a = Assembler::default();
     let mut line = String::new();
@@ -56,6 +68,9 @@ pub(crate) fn assemble(
             return Ok(chunk);
         }
         a.feed(&chunk, on_text);
+        if a.kept > max_bytes {
+            return Err("the LLM provider sent a reply too large to keep".into());
+        }
     }
     Ok(a.finish())
 }
@@ -79,6 +94,8 @@ struct Assembler {
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<Value>,
     usage: Option<Value>,
+    /// Bytes of text and tool-call pieces kept so far.
+    kept: usize,
 }
 
 impl Assembler {
@@ -112,6 +129,7 @@ impl Assembler {
         if let Some(t) = delta.get("content").and_then(Value::as_str) {
             self.has_content = true;
             if !t.is_empty() {
+                self.kept = self.kept.saturating_add(t.len());
                 self.content.push_str(t);
                 on_text(t);
             }
@@ -149,6 +167,7 @@ impl Assembler {
                 slot.name = name.to_owned();
             }
             if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                self.kept = self.kept.saturating_add(args.len());
                 slot.arguments.push_str(args);
             }
         }
@@ -304,6 +323,20 @@ mod tests {
             "x".repeat(MAX_LINE_BYTES)
         );
         assert!(assemble(long.as_bytes(), &mut |_| {}, &|| false).is_err());
+    }
+
+    #[test]
+    fn a_reply_too_large_to_keep_is_refused_whether_text_or_tool_arguments() {
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"12345\"}}]}
+"
+        .repeat(3);
+        assert!(assemble_capped(text.as_bytes(), &mut |_| {}, &|| false, 15).is_ok());
+        assert!(assemble_capped(text.as_bytes(), &mut |_| {}, &|| false, 14).is_err());
+        let args = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"12345\"}}]}}]}
+"
+            .repeat(3);
+        assert!(assemble_capped(args.as_bytes(), &mut |_| {}, &|| false, 14).is_err());
+        assert!(MAX_ASSEMBLED_BYTES as u64 == crate::transport::MAX_BODY_BYTES);
     }
 
     #[test]

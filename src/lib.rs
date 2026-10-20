@@ -21,12 +21,15 @@
 //!
 //! # Using it
 //!
-//! Register the adapter under [`PROVIDER_NAME`] where the app builds its client; a connection
-//! saved with that provider name and an account key (`ck-fant-…`) then works in every app that did:
+//! In `craft-ai-integrations` the adapter is built in: `ProviderFactory::standard()` and
+//! `::probing()` register it under [`PROVIDER_NAME`], so a connection saved with that provider name
+//! and an account key (`ck-fant-…`) works in every app with no setup of its own. Registering it
+//! again replaces the built-in one: an app does that to put its own name in the provider's usage
+//! reports, and an app that takes this crate on its own does it to add the adapter at all:
 //!
 //! ```ignore
 //! let mut factory = ProviderFactory::standard();
-//! factory.register(craft_ai_fantastico::PROVIDER_NAME, craft_ai_fantastico::build);
+//! factory.register(craft_ai_fantastico::PROVIDER_NAME, craft_ai_fantastico::build_titled("WordCraft"));
 //! ```
 //!
 //! Or build one directly:
