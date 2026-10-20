@@ -45,9 +45,9 @@ pub struct UreqWire {
 impl Default for UreqWire {
     fn default() -> Self {
         let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
             .tls_config(craft_ai_http::tls_config())
             .proxy(craft_ai_http::hosted_proxy())
+            .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)
             .build();

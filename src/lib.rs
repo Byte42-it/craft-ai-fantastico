@@ -344,6 +344,19 @@ fn build_with(
     key: Option<SecretString>,
     title: Option<String>,
 ) -> Result<Arc<dyn Provider>, AiError> {
+    let mut config = config_for(connection, key)?;
+    if let Some(title) = title {
+        config = config.with_title(title);
+    }
+    Ok(Arc::new(FantasticoProvider::new(config)?))
+}
+
+/// The settings [`build`] uses for a saved connection, for a caller that changes some (a time
+/// budget, the app's name) before building the provider.
+pub fn config_for(
+    connection: &Connection,
+    key: Option<SecretString>,
+) -> Result<FantasticoConfig, AiError> {
     let key = key.filter(|k| !k.is_empty()).ok_or_else(|| {
         AiError::new(
             ErrorKind::Auth,
@@ -354,16 +367,13 @@ fn build_with(
         )
     })?;
     let mut config = FantasticoConfig::new(key);
-    if let Some(title) = title {
-        config = config.with_title(title);
-    }
     if let Some(endpoint) = &connection.endpoint {
         config = config.with_base_url(endpoint.clone());
     }
     if !connection.models.is_empty() {
         config = config.with_models(connection.models.clone());
     }
-    Ok(Arc::new(FantasticoProvider::new(config)?))
+    Ok(config)
 }
 
 #[cfg(test)]
