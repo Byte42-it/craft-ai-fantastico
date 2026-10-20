@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn text_pieces_arrive_in_order_and_make_the_usual_reply() {
         let (v, pieces) = stream(&[
-            ": OPENROUTER PROCESSING",
+            ": keep-alive",
             r#"data: {"id":"gen-1","model":"m","created":7,"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
             r#"data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#,
             "",

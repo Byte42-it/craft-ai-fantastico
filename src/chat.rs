@@ -171,8 +171,8 @@ pub(crate) struct Completion {
     pub usage: Option<Usage>,
 }
 
-/// Token counts and what the request cost. The provider behind FANTASTICO is always OpenRouter,
-/// whose `usage.cost` is the charge in US dollars, so it is kept.
+/// Token counts and what the request cost: the model provider behind the account reports the
+/// charge in US dollars as `usage.cost`.
 fn usage_from(v: &Value) -> Option<Usage> {
     let u = v.get("usage").filter(|u| u.is_object())?;
     let n = |keys: &[&str]| keys.iter().find_map(|k| u.get(*k).and_then(Value::as_u64));

@@ -1,14 +1,13 @@
 //! The models a FANTASTICO account offers, and what each can do.
 //!
-//! The account service lists the chat models of the provider behind it (OpenRouter), entry for
-//! entry, with the `:batch` variants already removed because they cannot be called on
+//! The account service lists the chat models of the model provider behind it, entry for entry, with the `:batch` variants already removed because they cannot be called on
 //! `chat/completions`. Each entry is read for what it says rather than guessed from its id:
 //!
 //! - `architecture.output_modalities` without `text` means it is not a chat model: left out;
 //! - `supported_parameters` says whether it takes `tools` and `response_format`. When the list is
 //!   absent both are assumed, and the model refuses at run time if it cannot;
 //! - `pricing` is US dollars per token as a string, kept as millionths per million tokens;
-//! - `created` is when OpenRouter listed it, used as the release date.
+//! - `created` is when the provider listed it, used as the release date.
 //!
 //! Every model offers `text.complete` with streaming. A model id the list does not include can
 //! still be asked for (see [`assumed`]): the list changes daily and a saved choice should not
@@ -139,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn an_openrouter_entry_becomes_a_chat_model_with_its_price_and_features() {
+    fn a_catalogue_entry_becomes_a_chat_model_with_its_price_and_features() {
         let m = from_entry(&json!({
             "id": "anthropic/claude-sonnet-5", "name": "Anthropic: Claude Sonnet 5",
             "created": 1_760_000_000u64,

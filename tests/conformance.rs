@@ -19,9 +19,10 @@ use fantastico_sdk::{HttpRequest, Method};
 use serde_json::{Value, json};
 
 const ACCOUNT_KEY: &str = "ck-fant-account-needle";
-const RUNTIME_KEY: &str = "sk-or-runtime-needle";
+const RUNTIME_KEY: &str = "rk-runtime-needle";
 const BASE: &str = "https://fantastico.cc/api";
-const CHAT: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// The model call, wherever the SDK sends it: which provider serves it is the account's business.
+const CHAT: &str = "/chat/completions";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Chat {
@@ -75,7 +76,7 @@ fn json_reply(status: u16, v: Value) -> WireResponse {
 }
 
 fn sse(chunks: &[Value]) -> String {
-    let mut s = String::from(": OPENROUTER PROCESSING\n\n");
+    let mut s = String::from(": keep-alive\n\n");
     for c in chunks {
         s.push_str(&format!("data: {c}\n\n"));
     }
@@ -129,7 +130,7 @@ impl Wire for Fake {
                 ]}),
             ));
         }
-        if req.url != CHAT {
+        if req.url.starts_with(BASE) || !req.url.ends_with(CHAT) {
             return Ok(json_reply(404, json!({"message": "no such route"})));
         }
         let body: Value = serde_json::from_str(req.body.as_deref().unwrap_or("{}")).unwrap();
@@ -317,7 +318,7 @@ fn each_key_goes_only_where_it_belongs_and_one_key_serves_many_jobs() {
         if url.starts_with(BASE) {
             assert_eq!(auth, &format!("Bearer {ACCOUNT_KEY}"), "{url}");
         } else {
-            assert_eq!(url, CHAT);
+            assert!(url.ends_with(CHAT), "{url}");
             assert_eq!(auth, &format!("Bearer {RUNTIME_KEY}"));
         }
     }

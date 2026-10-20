@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn the_key_shape_and_the_address_are_checked_before_anything_is_sent() {
         assert!(FantasticoProvider::new(FantasticoConfig::new(key())).is_ok());
-        let wrong = FantasticoProvider::new(FantasticoConfig::new(SecretString::new("sk-or-x")));
+        let wrong = FantasticoProvider::new(FantasticoConfig::new(SecretString::new("sk-other-x")));
         assert_eq!(wrong.unwrap_err().kind, ErrorKind::Auth);
         for (url, ok) in [
             ("https://fantastico.cc/api/", true),
