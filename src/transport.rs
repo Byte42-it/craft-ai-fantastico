@@ -12,6 +12,7 @@
 
 use std::io::{BufReader, Read};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fantastico_sdk::{HttpRequest, HttpResponse, Method, Transport};
 use serde_json::Value;
@@ -40,21 +41,38 @@ pub trait Wire: Send + Sync {
 /// The real wire: blocking `ureq` with the platform's certificate check and no redirects.
 pub struct UreqWire {
     agent: ureq::Agent,
+    /// The longest any one request may take, over the time the SDK gives it.
+    request_cap: Option<Duration>,
 }
 
 impl Default for UreqWire {
     fn default() -> Self {
+        Self::with_timeouts(None, None)
+    }
+}
+
+impl UreqWire {
+    /// `connect` bounds connecting; `request` caps each request, whose own time the SDK sets (the
+    /// shorter of the two wins). `None` leaves the SDK's times as they are.
+    pub fn with_timeouts(connect: Option<Duration>, request: Option<Duration>) -> Self {
         let config = ureq::Agent::config_builder()
             .tls_config(craft_ai_http::tls_config())
             .proxy(craft_ai_http::hosted_proxy())
             .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)
+            .timeout_connect(connect)
             .build();
         Self {
             agent: config.into(),
+            request_cap: request,
         }
     }
+}
+
+/// A request's time: its own, or the cap when that is shorter.
+pub(crate) fn capped(own: Duration, cap: Option<Duration>) -> Duration {
+    cap.map_or(own, |c| own.min(c))
 }
 
 impl std::fmt::Debug for UreqWire {
@@ -66,13 +84,14 @@ impl std::fmt::Debug for UreqWire {
 fn with_headers<B>(
     mut builder: ureq::RequestBuilder<B>,
     request: &HttpRequest,
+    cap: Option<Duration>,
 ) -> ureq::RequestBuilder<B> {
     for (k, v) in &request.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
     builder
         .config()
-        .timeout_global(Some(request.timeout))
+        .timeout_global(Some(capped(request.timeout, cap)))
         .build()
 }
 
@@ -80,9 +99,11 @@ impl Wire for UreqWire {
     fn send(&self, request: &HttpRequest) -> Result<WireResponse, String> {
         let url = request.url.as_str();
         let result = match request.method {
-            Method::Get => with_headers(self.agent.get(url), request).call(),
-            Method::Delete => with_headers(self.agent.delete(url), request).call(),
-            Method::Post => with_headers(self.agent.post(url), request)
+            Method::Get => with_headers(self.agent.get(url), request, self.request_cap).call(),
+            Method::Delete => {
+                with_headers(self.agent.delete(url), request, self.request_cap).call()
+            }
+            Method::Post => with_headers(self.agent.post(url), request, self.request_cap)
                 .send(request.body.as_deref().unwrap_or("")),
         };
         let response = result.map_err(|e| e.to_string())?;
@@ -196,6 +217,17 @@ mod tests {
         )));
         assert!(!wants_stream(&req(Method::Post, Some("{not json"))));
         assert!(!wants_stream(&req(Method::Get, None)));
+    }
+
+    #[test]
+    fn a_request_takes_the_shorter_of_its_own_time_and_the_cap() {
+        let s = Duration::from_secs;
+        assert_eq!(capped(s(90), Some(s(20))), s(20));
+        assert_eq!(capped(s(30), Some(s(600))), s(30));
+        assert_eq!(capped(s(90), None), s(90));
+        // Built either way without a request being sent.
+        let _ = UreqWire::with_timeouts(Some(s(5)), Some(s(20)));
+        let _ = UreqWire::default();
     }
 
     #[test]

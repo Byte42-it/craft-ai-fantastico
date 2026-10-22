@@ -100,8 +100,13 @@ pub struct FantasticoConfig {
     pub product: Option<String>,
     /// Use these models instead of asking the account service.
     pub models: Option<Vec<ModelInfo>>,
-    /// The longest one request may take, retries included.
+    /// The longest one request may take, retries included (the SDK's retry schedule).
     pub budget: Duration,
+    /// The longest connecting may take; `None`: the HTTP stack's default.
+    pub connect_timeout: Option<Duration>,
+    /// The longest any single HTTP request may take; `None`: the SDK's own per-request times
+    /// (30 s for the account service, 90 s for the model).
+    pub request_timeout: Option<Duration>,
     /// Jobs that may run at once on this connection. Each running job holds its own runtime key,
     /// and each key reserves part of the account's credit, so this stays small.
     pub max_active_jobs: usize,
@@ -127,6 +132,8 @@ impl FantasticoConfig {
             product: None,
             models: None,
             budget: Duration::from_secs(300),
+            connect_timeout: None,
+            request_timeout: None,
             max_active_jobs: 2,
         }
     }
@@ -204,7 +211,8 @@ impl std::fmt::Debug for FantasticoProvider {
 impl FantasticoProvider {
     /// Checks the key's shape and the base URL. Nothing is sent yet.
     pub fn new(config: FantasticoConfig) -> Result<Self, AiError> {
-        Self::with_wire(config, Arc::new(UreqWire::default()))
+        let wire = UreqWire::with_timeouts(config.connect_timeout, config.request_timeout);
+        Self::with_wire(config, Arc::new(wire))
     }
 
     /// As [`new`](Self::new), sending every request through `wire`: another HTTP stack, or a test

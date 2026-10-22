@@ -32,7 +32,10 @@ fn assemble_capped(
     stop: &dyn Fn() -> bool,
     max_bytes: usize,
 ) -> Result<Value, String> {
-    let mut a = Assembler::default();
+    let mut a = Assembler {
+        max: max_bytes,
+        ..Assembler::default()
+    };
     let mut line = String::new();
     let cap = u64::try_from(MAX_LINE_BYTES)
         .unwrap_or(u64::MAX)
@@ -68,7 +71,7 @@ fn assemble_capped(
             return Ok(chunk);
         }
         a.feed(&chunk, on_text);
-        if a.kept > max_bytes {
+        if a.over {
             return Err("the LLM provider sent a reply too large to keep".into());
         }
     }
@@ -94,8 +97,11 @@ struct Assembler {
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<Value>,
     usage: Option<Value>,
-    /// Bytes of text and tool-call pieces kept so far.
+    /// Bytes of text and tool-call pieces kept so far, and the most that may be kept.
     kept: usize,
+    max: usize,
+    /// A piece came that would pass `max`: it was dropped, and the reply is refused.
+    over: bool,
 }
 
 impl Assembler {
@@ -129,7 +135,9 @@ impl Assembler {
         if let Some(t) = delta.get("content").and_then(Value::as_str) {
             self.has_content = true;
             if !t.is_empty() {
-                self.kept = self.kept.saturating_add(t.len());
+                if !self.room_for(t.len()) {
+                    return;
+                }
                 self.content.push_str(t);
                 on_text(t);
             }
@@ -167,10 +175,28 @@ impl Assembler {
                 slot.name = name.to_owned();
             }
             if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
-                self.kept = self.kept.saturating_add(args.len());
+                // As `room_for`, on the fields directly: `slot` borrows the tool calls.
+                let kept = self.kept.saturating_add(args.len());
+                if kept > self.max {
+                    self.over = true;
+                    return;
+                }
+                self.kept = kept;
                 slot.arguments.push_str(args);
             }
         }
+    }
+
+    /// Whether `n` more bytes fit; counts them when they do. Checked before a piece is kept, so
+    /// nothing past the cap is ever allocated.
+    fn room_for(&mut self, n: usize) -> bool {
+        let kept = self.kept.saturating_add(n);
+        if kept > self.max {
+            self.over = true;
+            return false;
+        }
+        self.kept = kept;
+        true
     }
 
     fn finish(self) -> Value {
@@ -337,6 +363,28 @@ mod tests {
             .repeat(3);
         assert!(assemble_capped(args.as_bytes(), &mut |_| {}, &|| false, 14).is_err());
         assert!(MAX_ASSEMBLED_BYTES as u64 == crate::transport::MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn a_piece_past_the_cap_is_never_kept_or_shown() {
+        let mut shown = Vec::new();
+        let big = r#"{"choices":[{"delta":{"content":"0123456789"}}]}"#;
+        let mut a = Assembler {
+            max: 4,
+            ..Assembler::default()
+        };
+        a.feed(&serde_json::from_str(big).unwrap(), &mut |t| {
+            shown.push(t.to_owned())
+        });
+        assert!(a.over && a.content.is_empty() && shown.is_empty());
+        let args = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"0123456789"}}]}}]}"#;
+        let mut a = Assembler {
+            max: 4,
+            ..Assembler::default()
+        };
+        a.feed(&serde_json::from_str(args).unwrap(), &mut |_| {});
+        assert!(a.over);
+        assert!(a.tool_calls.iter().all(|c| c.arguments.is_empty()));
     }
 
     #[test]
