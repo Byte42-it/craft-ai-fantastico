@@ -51,6 +51,13 @@ fn assemble_capped(
             .read_line(&mut line)
             .map_err(|e| e.to_string())?;
         if n == 0 {
+            // The connection closed: a reply is whole only with its `[DONE]` (handled below) or
+            // a finish reason. Anything else was cut short and is not passed off as an answer.
+            if a.finish_reason.is_none() {
+                return Err(
+                    "the LLM provider ended the stream before the reply was complete".into(),
+                );
+            }
             break;
         }
         if line.len() > MAX_LINE_BYTES {
@@ -321,13 +328,14 @@ mod tests {
         ]);
         assert_eq!(pieces, ["par"]);
         assert_eq!(v["error"]["message"], "overloaded");
-        let (v, _) = stream(&[]);
+        let (v, _) = stream(&["data: [DONE]"]);
         assert_eq!(v["choices"][0]["message"]["content"], "");
         let (v, _) = stream(&[
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1e12,"function":{"name":"x"}}]}}]}"#,
             r#"data: {"choices":"nope"}"#,
             r#"data: {"choices":[{"delta":"nope"}]}"#,
             r#"data: 7"#,
+            "data: [DONE]",
         ]);
         assert_eq!(
             v["choices"][0]["message"]["tool_calls"]
@@ -337,6 +345,7 @@ mod tests {
         );
         let (v, _) = stream(&[
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":123456789,"function":{"name":"x"}}]}}]}"#,
+            "data: [DONE]",
         ]);
         assert_eq!(
             v["choices"][0]["message"]["tool_calls"]
@@ -344,18 +353,22 @@ mod tests {
                 .map(Vec::len),
             Some(MAX_TOOL_CALLS + 1)
         );
+        // A finished stream around the long line: only the line cap can refuse it.
         let long = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}",
-            "x".repeat(MAX_LINE_BYTES)
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n{}\ndata: [DONE]\n",
+            "x".repeat(MAX_LINE_BYTES),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#
         );
-        assert!(assemble(long.as_bytes(), &mut |_| {}, &|| false).is_err());
+        let e = assemble(long.as_bytes(), &mut |_| {}, &|| false).unwrap_err();
+        assert!(e.contains("too long"), "{e}");
     }
 
     #[test]
     fn a_reply_too_large_to_keep_is_refused_whether_text_or_tool_arguments() {
         let text = "data: {\"choices\":[{\"delta\":{\"content\":\"12345\"}}]}
 "
-        .repeat(3);
+        .repeat(3)
+            + "data: [DONE]\n";
         assert!(assemble_capped(text.as_bytes(), &mut |_| {}, &|| false, 15).is_ok());
         assert!(assemble_capped(text.as_bytes(), &mut |_| {}, &|| false, 14).is_err());
         let args = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"12345\"}}]}}]}
@@ -363,6 +376,23 @@ mod tests {
             .repeat(3);
         assert!(assemble_capped(args.as_bytes(), &mut |_| {}, &|| false, 14).is_err());
         assert!(MAX_ASSEMBLED_BYTES as u64 == crate::transport::MAX_BODY_BYTES);
+    }
+
+    /// A stream the connection cut short is an error, not a shorter answer; one that said how it
+    /// finished is whole even without `[DONE]`.
+    #[test]
+    fn a_stream_cut_short_is_refused_and_a_finished_one_kept() {
+        let piece = r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#;
+        let cut = format!("{piece}\n");
+        let e = assemble(cut.as_bytes(), &mut |_| {}, &|| false).unwrap_err();
+        assert!(e.contains("before the reply was complete"), "{e}");
+        assert!(assemble(&b""[..], &mut |_| {}, &|| false).is_err());
+        let finished = format!(
+            "{piece}\n{}\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#
+        );
+        let v = assemble(finished.as_bytes(), &mut |_| {}, &|| false).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hel");
     }
 
     #[test]
