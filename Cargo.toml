@@ -14,7 +14,7 @@ craft-ai-core = { git = "https://github.com/storytold/craft-ai-integrations", re
 craft-ai-http = { git = "https://github.com/storytold/craft-ai-integrations", rev = "ea85917afe35afcd48a6d19a27daca0621c74db2" }
 # Mints the account's runtime keys, fills in `max_tokens`, retries and classifies failures. Its own
 # transport is left out: requests go through ours, which streams and takes the layer's TLS rule.
-fantastico-sdk = { version = "0.2.0", default-features = false }
+fantastico-sdk = { version = "=0.2.1", default-features = false }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 

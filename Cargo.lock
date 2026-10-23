@@ -93,9 +93,9 @@ dependencies = [
 
 [[package]]
 name = "fantastico-sdk"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcd56dee603c094b5e814b9a576608652e57481b605388a2b73c6a18734fe38e"
+checksum = "435f7391450c352a563bec3b930d10aae267136e95e8ee81c8d8b9f6fe02c142"
 dependencies = [
  "serde_json",
 ]
